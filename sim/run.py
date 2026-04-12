@@ -89,7 +89,7 @@ class Policy:
         print(f"[Policy] Loaded: {len(self.layers)} layers, "
               f"obs={self.obs_size}, history={self.observation_history}")
 
-    def step(self, ang_vel, gravity, cmd_vel, desired_z, joint_pos, joint_vel):
+    def step(self, ang_vel, gravity, cmd_vel, desired_z, joint_pos):
         """
         Compute one policy step.
 
@@ -99,7 +99,6 @@ class Policy:
             cmd_vel: (3,) [x_vel, y_vel, yaw_vel]
             desired_z: (3,) desired world Z-axis in body frame
             joint_pos: (12,) current joint positions
-            joint_vel: (12,) current joint velocities
         """
         obs_dim = 36
         # Build single observation (36-dim)
@@ -119,9 +118,6 @@ class Policy:
         x = self.obs_buf.copy()
         for W, b, act in self.layers:
             x = act(x @ W + b)
-
-        # Store action for next step
-        self.prev_action = x.copy()
 
         return x
 
@@ -251,6 +247,15 @@ def run(mjcf_path: str, policy_path: str):
     model = mujoco.MjModel.from_xml_string(xml)
     data = mujoco.MjData(model)
 
+    # Convert actuators to pure torque mode (mimics actuator_model.hpp behavior)
+    # Original: force = 5*(ctrl-qpos) - 0.1*qvel (position actuator)
+    # We want:  force = ctrl (torque command), PD computed in Python
+    for i in range(model.nu):
+        model.actuator(i).gainprm[0] = 1.0
+        model.actuator(i).biasprm[0] = 0.0
+        model.actuator(i).biasprm[1] = 0.0
+        model.actuator(i).biasprm[2] = 0.0
+
     policy = Policy(policy_path)
     keyboard = Keyboard()
 
@@ -275,36 +280,40 @@ def run(mjcf_path: str, policy_path: str):
           f"{nu} actuators, dt={model.opt.timestep}s")
     print(f"[Sim] qpos={nq}, qvel={nv}, n_sensor={model.nsensor}")
 
-    # Match training physics: override dof_damping for hinge joints
-    # Training used dof_damping=0.25 (on top of actuator kd=0.1)
-    for i in range(6, model.nv):  # skip free joint DOFs 0-5
-        model.dof_damping[i] = 0.25
-
     # Create viewer
     from mujoco import viewer as _viewer
     viewer = _viewer.launch_passive(model, data)
 
     # Simulation timing
     policy_hz = 50
-    sim_steps_per_policy = int(1.0 / (policy_hz * model.opt.timestep))  # ~50 steps at 0.004s
+    sim_steps_per_policy = int(1.0 / (policy_hz * model.opt.timestep))  # ~5 steps at 0.004s
 
     step_count = 0
     fade_in = 0.0
-    fade_in_duration = 1.0  # seconds
+    init_duration = 1.0     # seconds: interpolate from keyframe to default
+    fade_in_duration = 1.0  # seconds: ramp policy output
+    debug_steps = 5
 
-    # Reset to home
+    # Actuator params (from actuator_model.hpp via ros2_control xacro)
+    kp = 7.5
+    kd = 0.25
+    bus_voltage = 24.0
+    kt = 0.04
+    phase_resistance = 0.7
+    saturation_torque = 4.5
+    software_torque_limit = 3.0
+
+    # Init: capture joint positions from keyframe (all zeros, feet on ground)
     mujoco.mj_resetData(model, data)
-    # Set initial joint positions to default
-    for i, jid in enumerate(joint_ids):
-        qpos_adr = model.jnt_qposadr[jid]
-        data.qpos[qpos_adr] = policy.default_joint_pos[i]
-    mujoco.mj_forward(model, data)
+    init_joint_pos = np.array(
+        [data.qpos[model.jnt_qposadr[jid]] for jid in joint_ids], dtype=np.float32
+    )
+    target = init_joint_pos.copy()  # start from keyframe pose
 
     policy.reset()
+    start_time = time.time()
 
     print("[Sim] Running... Arrows=move, PgUp/PgDn=rotate, Space=estop, R=reset, Esc=quit")
-
-    start_time = time.time()
 
     while viewer.is_running() and not keyboard.quit:
         keyboard.update()
@@ -312,62 +321,62 @@ def run(mjcf_path: str, policy_path: str):
         # Handle reset
         if keyboard.reset:
             mujoco.mj_resetData(model, data)
-            for i, jid in enumerate(joint_ids):
-                qpos_adr = model.jnt_qposadr[jid]
-                data.qpos[qpos_adr] = policy.default_joint_pos[i]
-            mujoco.mj_forward(model, data)
+            init_joint_pos = np.array(
+                [data.qpos[model.jnt_qposadr[jid]] for jid in joint_ids], dtype=np.float32
+            )
+            target = init_joint_pos.copy()
             policy.reset()
-            fade_in = 0.0
-            keyboard.reset = False
             start_time = time.time()
+            keyboard.reset = False
             print("[Sim] Reset!")
 
         # Read sensors
-        gyro = data.sensordata[gyro_id:gyro_id + 3].copy()  # angular velocity
         quat = data.sensordata[quat_id:quat_id + 4].copy()  # [w, x, y, z]
+        w, x, y, z = quat
+
+        # Rotation matrix (world → body)
+        R = np.array([
+            [1 - 2*(y*y + z*z), 2*(x*y - w*z),     2*(x*z + w*y)],
+            [2*(x*y + w*z),     1 - 2*(x*x + z*z), 2*(y*z - w*x)],
+            [2*(x*z - w*y),     2*(y*z + w*x),     1 - 2*(x*x + y*y)],
+        ], dtype=np.float32)
 
         # Project gravity to body frame
-        gravity_body = quat_to_gravity(quat)
+        gravity_body = R @ np.array([0.0, 0.0, -1.0], dtype=np.float32)
 
-        # Desired Z in body frame = rotation matrix column 2
-        w, x, y, z = quat
-        desired_z = np.array([
-            2*(x*z + w*y),
-            2*(y*z - w*x),
-            1 - 2*(x*x + y*y),
-        ], dtype=np.float32)
+        # MuJoCo <gyro> already returns body-frame angular velocity
+        gyro_body = data.sensordata[gyro_id:gyro_id + 3].copy()
+
+        # Desired Z in body frame = R column 2
+        desired_z = R[:, 2].copy()
 
         # Joint positions and velocities
         joint_pos = np.array([data.qpos[model.jnt_qposadr[jid]] for jid in joint_ids], dtype=np.float32)
         joint_vel = np.array([data.qvel[model.jnt_dofadr[jid]] for jid in joint_ids], dtype=np.float32)
 
-        # Compute policy action at 50Hz
+        # Update target at policy_hz (50Hz)
         if step_count % sim_steps_per_policy == 0:
             elapsed = time.time() - start_time
-            fade_in = min(1.0, elapsed / fade_in_duration)
 
-            raw_action = policy.step(
-                ang_vel=gyro,
-                gravity=gravity_body,
-                cmd_vel=keyboard.cmd_vel if not keyboard.estop else np.zeros(3),
-                desired_z=desired_z,
-                joint_pos=joint_pos,
-                joint_vel=joint_vel,
-            )
-
-            # Apply action with fade-in and clamping
-            # Training used action_scale=0.75 (from conf), JSON stores 1.0
-            action_scale = 0.75
-            target = fade_in * raw_action * action_scale + policy.default_joint_pos
-            target = np.clip(target, policy.joint_lower, policy.joint_upper)
+            if elapsed < init_duration:
+                # INIT PHASE: interpolate from keyframe pose to default_joint_pos
+                alpha = elapsed / init_duration
+                target = init_joint_pos * (1.0 - alpha) + policy.default_joint_pos * alpha
+            # else: keep holding default_joint_pos (policy disabled for debugging)
 
             if keyboard.estop:
                 target = policy.default_joint_pos.copy()
 
-            # MuJoCo position actuator: force = kp*(ctrl - qpos) - kd*qvel
-            # ctrl IS the position target, PD is handled by the actuator
-            for i in range(12):
-                data.ctrl[i] = target[i]
+        # Compute PD torque EVERY physics step
+        for i in range(12):
+            torque = kp * (target[i] - joint_pos[i]) + kd * (0.0 - joint_vel[i])
+            torque = np.clip(torque, -software_torque_limit, software_torque_limit)
+            emf = abs(kt * joint_vel[i])
+            max_current = (bus_voltage - emf) / phase_resistance
+            emf_limited_torque = max_current * kt
+            torque = np.clip(torque, -emf_limited_torque, emf_limited_torque)
+            torque = np.clip(torque, -saturation_torque, saturation_torque)
+            data.ctrl[i] = torque
 
         # Step simulation
         mujoco.mj_step(model, data)
