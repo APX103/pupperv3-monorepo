@@ -289,10 +289,8 @@ def run(mjcf_path: str, policy_path: str):
     sim_steps_per_policy = int(1.0 / (policy_hz * model.opt.timestep))  # ~5 steps at 0.004s
 
     step_count = 0
-    fade_in = 0.0
     init_duration = 1.0     # seconds: interpolate from keyframe to default
     fade_in_duration = 1.0  # seconds: ramp policy output
-    debug_steps = 5
 
     # Actuator params (from actuator_model.hpp via ros2_control xacro)
     kp = 7.5
@@ -303,12 +301,14 @@ def run(mjcf_path: str, policy_path: str):
     saturation_torque = 4.5
     software_torque_limit = 3.0
 
-    # Init: capture joint positions from keyframe (all zeros, feet on ground)
+    # Init: set to keyframe "home" (body at z=0.28, joints=0, feet on ground)
     mujoco.mj_resetData(model, data)
-    init_joint_pos = np.array(
-        [data.qpos[model.jnt_qposadr[jid]] for jid in joint_ids], dtype=np.float32
-    )
-    target = init_joint_pos.copy()  # start from keyframe pose
+    data.qpos[0:3] = [0.0, 0.0, 0.28]       # body position
+    data.qpos[3:7] = [1.0, 0.0, 0.0, 0.0]    # body quaternion
+    data.qpos[7:] = 0.0                         # all joints = 0
+    mujoco.mj_forward(model, data)
+    init_joint_pos = np.zeros(12, dtype=np.float32)  # keyframe joints are 0
+    target = init_joint_pos.copy()
 
     policy.reset()
     start_time = time.time()
@@ -321,10 +321,11 @@ def run(mjcf_path: str, policy_path: str):
         # Handle reset
         if keyboard.reset:
             mujoco.mj_resetData(model, data)
-            init_joint_pos = np.array(
-                [data.qpos[model.jnt_qposadr[jid]] for jid in joint_ids], dtype=np.float32
-            )
-            target = init_joint_pos.copy()
+            data.qpos[0:3] = [0.0, 0.0, 0.28]
+            data.qpos[3:7] = [1.0, 0.0, 0.0, 0.0]
+            data.qpos[7:] = 0.0
+            mujoco.mj_forward(model, data)
+            target = np.zeros(12, dtype=np.float32)
             policy.reset()
             start_time = time.time()
             keyboard.reset = False
@@ -341,8 +342,9 @@ def run(mjcf_path: str, policy_path: str):
             [2*(x*z - w*y),     2*(y*z + w*x),     1 - 2*(x*x + y*y)],
         ], dtype=np.float32)
 
-        # Project gravity to body frame
+        # Project gravity to body frame and L2-normalize (matches training env)
         gravity_body = R @ np.array([0.0, 0.0, -1.0], dtype=np.float32)
+        gravity_body = gravity_body / (np.linalg.norm(gravity_body) + 1e-8)
 
         # MuJoCo <gyro> already returns body-frame angular velocity
         gyro_body = data.sensordata[gyro_id:gyro_id + 3].copy()
@@ -362,10 +364,34 @@ def run(mjcf_path: str, policy_path: str):
                 # INIT PHASE: interpolate from keyframe pose to default_joint_pos
                 alpha = elapsed / init_duration
                 target = init_joint_pos * (1.0 - alpha) + policy.default_joint_pos * alpha
-            # else: keep holding default_joint_pos (policy disabled for debugging)
+            else:
+                # FADE-IN PHASE: run policy with gradual ramp
+                fade_in = min(1.0, (elapsed - init_duration) / fade_in_duration)
+                policy_step_num = int((elapsed - init_duration) * policy_hz)
 
-            if keyboard.estop:
-                target = policy.default_joint_pos.copy()
+                raw_action = policy.step(
+                    ang_vel=gyro_body,
+                    gravity=gravity_body,
+                    cmd_vel=keyboard.cmd_vel if not keyboard.estop else np.zeros(3),
+                    desired_z=desired_z,
+                    joint_pos=joint_pos,
+                )
+
+                if policy_step_num < 3:
+                    jd = joint_pos - policy.default_joint_pos
+                    print(f"[P{policy_step_num}] fi={fade_in:.3f} gyro={gyro_body} grav={gravity_body}")
+                    print(f"         jdev={[f'{v:+.3f}' for v in jd]}")
+                    print(f"         raw={[f'{v:+.3f}' for v in raw_action]} tgt={[f'{v:+.3f}' for v in target]}")
+
+                scaled_action = fade_in * raw_action
+                target = scaled_action * policy.action_scale + policy.default_joint_pos
+                target = np.clip(target, policy.joint_lower, policy.joint_upper)
+
+                if keyboard.estop:
+                    target = policy.default_joint_pos.copy()
+                    scaled_action = np.zeros(12, dtype=np.float32)
+
+                policy.prev_action = scaled_action
 
         # Compute PD torque EVERY physics step
         for i in range(12):
