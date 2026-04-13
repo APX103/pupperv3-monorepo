@@ -32,8 +32,11 @@ class RTNeuralPolicy:
         with open(json_path, "r") as f:
             data = json.load(f)
 
-        self.input_size = data["in_shape"][1]
-        self.output_size = data["layers"][-1]["shape"][0]
+        # in_shape may be [None, 720] or [1, 720]
+        self.input_size = [s for s in data["in_shape"] if s is not None][-1]
+        # shape may be [None, N] or [N]
+        last_shape = data["layers"][-1]["shape"]
+        self.output_size = [s for s in last_shape if s is not None][-1]
         self.observation_history = data.get("observation_history", 1)
         self.action_scale = data.get("action_scale", 0.75)
         self.default_joint_pos = np.array(
@@ -45,7 +48,7 @@ class RTNeuralPolicy:
         for layer_data in data["layers"]:
             if layer_data["type"] != "dense":
                 raise ValueError(f"Unsupported layer type: {layer_data['type']}")
-            weights = np.array(layer_data["weights"][0], dtype=np.float32).T
+            weights = np.array(layer_data["weights"][0], dtype=np.float32)
             bias = np.array(layer_data["weights"][1], dtype=np.float32)
             self.layers.append(DenseLayer(
                 weight=weights,
