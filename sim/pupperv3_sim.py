@@ -222,7 +222,7 @@ def main():
         fb_w, fb_h = glfw.get_framebuffer_size(window)
         viewport = mujoco.MjrRect(0, 0, fb_w, fb_h)
 
-        mujoco.mjv_updateScene(model, data, vopt, perturb, cam, scene)
+        mujoco.mjv_updateScene(model, data, vopt, perturb, cam, -1, scene)
         mujoco.mjr_render(viewport, scene, con)
 
         glfw.swap_buffers(window)
