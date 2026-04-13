@@ -3,6 +3,7 @@ name = "pupperv3-sim"
 version = "0.1.0"
 requires-python = ">=3.11"
 dependencies = [
+    "glfw>=2.10.0",
     "mujoco>=2.3.0",
     "numpy>=1.24",
 ]

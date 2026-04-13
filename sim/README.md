@@ -20,18 +20,16 @@ uv sync
 # 拉取策略文件（Git LFS）
 git lfs pull --include="ros2_ws/src/neural_controller/launch/policy_latest.json"
 
-# 启动仿真（macOS 需要 mjpython）
+# 启动仿真
 cd sim
-uv run mjpython pupperv3_sim.py ../ros2_ws/src/neural_controller/launch/policy_latest.json
+uv run python pupperv3_sim.py ../ros2_ws/src/neural_controller/launch/policy_latest.json
 ```
 
 不带策略启动（零动作，仅渲染）：
 
 ```bash
-uv run mjpython pupperv3_sim.py
+uv run python pupperv3_sim.py
 ```
-
-> **macOS 注意：** MuJoCo viewer 在 macOS 上必须通过 `mjpython` 运行（它绑定了 macOS 应用事件循环）。Linux 无此限制，可直接用 `uv run python`。
 
 ## 键盘控制
 
