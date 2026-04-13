@@ -82,12 +82,6 @@ def main():
         print("Failed to initialize GLFW")
         sys.exit(1)
 
-    # Request OpenGL 3.3 core profile (needed for glBlitFramebuffer)
-    glfw.window_hint(glfw.CONTEXT_VERSION_MAJOR, 3)
-    glfw.window_hint(glfw.CONTEXT_VERSION_MINOR, 3)
-    glfw.window_hint(glfw.OPENGL_PROFILE, glfw.OPENGL_CORE_PROFILE)
-    glfw.window_hint(glfw.OPENGL_FORWARD_COMPAT, True)
-
     window = glfw.create_window(WINDOW_W, WINDOW_H, "Pupper V3 Sim", None, None)
     if not window:
         glfw.terminate()
@@ -97,18 +91,21 @@ def main():
     glfw.make_context_current(window)
     glfw.swap_interval(1)
 
-    # Create offscreen renderer
-    renderer = mujoco.Renderer(model, width=WINDOW_W, height=WINDOW_H)
-    renderer.enable_contact_rendering = True
+    # --- MuJoCo rendering (direct to GLFW window, no offscreen) ---
+    con = mujoco.MjrContext(model, mujoco.mjtFontScale.mjFONTSCALE_150)
+    scene = mujoco.MjvScene(model, maxgeom=10000)
+    vopt = mujoco.MjvOption()
+    vopt.flags[mujoco.mjtVisFlag.mjVIS_CONTACTPOINT] = True
+    perturb = mujoco.MjvPerturb()
 
     # Camera
     cam = mujoco.MjvCamera()
     cam.type = mujoco.mjtCamera.mjCAMERA_TRACKING
-    cam.trackbodyid = 1  # base_link
+    cam.trackbodyid = 1
     cam.distance = 1.5
     cam.elevation = -30
 
-    # Keyboard state: process each key once on press
+    # Keyboard
     def on_key(window, key, scancode, action, mods):
         nonlocal cmd_vel, last_action
         if action != glfw.PRESS:
@@ -138,50 +135,56 @@ def main():
 
     glfw.set_key_callback(window, on_key)
 
-    # Mouse camera control state
-    _button_left = False
-    _button_middle = False
-    _button_right = False
-    _last_mouse = (0.0, 0.0)
+    # Mouse camera control
+    _last_mouse = [0.0, 0.0]
+    _button = [0, 0, 0]  # left, middle, right
+    _scroll = [0]
 
     def on_mouse_button(window, button, action, mods):
-        nonlocal _button_left, _button_middle, _button_right
         if action == glfw.PRESS:
             if button == glfw.MOUSE_BUTTON_LEFT:
-                _button_left = True
+                _button[0] = 1
             elif button == glfw.MOUSE_BUTTON_MIDDLE:
-                _button_middle = True
+                _button[1] = 1
             elif button == glfw.MOUSE_BUTTON_RIGHT:
-                _button_right = True
+                _button[2] = 1
         elif action == glfw.RELEASE:
-            _button_left = _button_middle = _button_right = False
+            _button[0] = _button[1] = _button[2] = 0
 
     def on_mouse_move(window, xpos, ypos):
-        nonlocal _last_mouse
         dx = xpos - _last_mouse[0]
         dy = ypos - _last_mouse[1]
-        _last_mouse = (xpos, ypos)
+        _last_mouse[0] = xpos
+        _last_mouse[1] = ypos
 
-        if _button_right:
-            cam.distance = max(0.3, cam.distance * (1 + dy * 0.005))
-        elif _button_middle:
-            cam.type = mujoco.mjtCamera.mjCAMERA_FREE
-            cam.elevation = np.clip(cam.elevation - dy * 0.5, -90, 90)
-            cam.azimuth += dx * 0.5
+        width, height = glfw.get_window_size(window)
+        if width == 0 or height == 0:
+            return
+
+        if _button[0]:
+            action = mujoco.mjtMouse.mjMOUSE_ROTATE_V
+        elif _button[1]:
+            action = mujoco.mjtMouse.mjMOUSE_MOVE_V
+        elif _button[2]:
+            action = mujoco.mjtMouse.mjMOUSE_ZOOM
+        else:
+            return
+
+        mujoco.mjv_moveCamera(
+            model, action, dx / width, dy / height, scene, cam,
+        )
 
     def on_scroll(window, xoff, yoff):
-        cam.distance = max(0.3, cam.distance * (1 - yoff * 0.05))
+        width, height = glfw.get_window_size(window)
+        if width == 0 or height == 0:
+            return
+        mujoco.mjv_moveCamera(
+            model, mujoco.mjtMouse.mjMOUSE_ZOOM, 0, -0.05 * yoff, scene, cam,
+        )
 
     glfw.set_mouse_button_callback(window, on_mouse_button)
     glfw.set_cursor_pos_callback(window, on_mouse_move)
     glfw.set_scroll_callback(window, on_scroll)
-
-    # Track if window size changed
-    def on_framebuffer_size(window, w, h):
-        renderer.update_viewport(w, h)
-        renderer.resize(w, h)
-
-    glfw.set_framebuffer_size_callback(window, on_framebuffer_size)
 
     print("Running. Arrow keys: move, Z/X: yaw, C: zero vel, R: reset. Mouse: orbit/zoom.")
 
@@ -193,8 +196,6 @@ def main():
         # Read sensors
         ang_vel = np.array(data.sensor("body_gyro").data[:3], dtype=np.float32)
         quat = np.array(data.sensor("body_quat").data[:4], dtype=np.float32)
-
-        # Read joint positions
         joint_pos = np.array([data.qpos[adr] for adr in joint_qpos_adr], dtype=np.float32)
 
         # Build observation and run policy
@@ -217,37 +218,12 @@ def main():
 
         step_count += 1
 
-        # Render
-        renderer.update_scene(data, camera=cam)
-        renderer.render()
-        framebuffer_width, framebuffer_height = glfw.get_framebuffer_size(window)
-        renderer.update_viewport(framebuffer_width, framebuffer_height)
+        # Render directly to GLFW window framebuffer
+        fb_w, fb_h = glfw.get_framebuffer_size(window)
+        viewport = mujoco.MjrRect(0, 0, fb_w, fb_h)
 
-        # Blit offscreen render to GLFW window
-        # The renderer renders to its own FBO; we need to display it on screen.
-        # mujoco.Renderer.render_buffer stores the FBO ID.
-        try:
-            import ctypes
-            GL_READ_FRAMEBUFFER = 0x8CA8
-            GL_DRAW_FRAMEBUFFER = 0x8CA9
-            GL_COLOR_BUFFER_BIT = 0x00004000
-            GL_NEAREST = 0x2600
-
-            gl = ctypes.cdll.LoadLibrary(
-                "/System/Library/Frameworks/OpenGL.framework/OpenGL"
-            )
-            src_fbo = renderer.render_buffer
-            gl.glBindFramebuffer(GL_READ_FRAMEBUFFER, ctypes.c_uint(src_fbo))
-            gl.glBindFramebuffer(GL_DRAW_FRAMEBUFFER, ctypes.c_uint(0))
-            gl.glBlitFramebuffer(
-                ctypes.c_int(0), ctypes.c_int(0),
-                ctypes.c_int(framebuffer_width), ctypes.c_int(framebuffer_height),
-                ctypes.c_int(0), ctypes.c_int(0),
-                ctypes.c_int(framebuffer_width), ctypes.c_int(framebuffer_height),
-                ctypes.c_uint(GL_COLOR_BUFFER_BIT), ctypes.c_uint(GL_NEAREST),
-            )
-        except Exception:
-            pass  # blit not critical for basic functionality
+        mujoco.mjv_updateScene(model, data, vopt, perturb, cam, scene)
+        mujoco.mjr_render(viewport, scene, con)
 
         glfw.swap_buffers(window)
 
@@ -255,7 +231,7 @@ def main():
             print(f"Step {step_count} | cmd=({cmd_vel[0]:+.2f},{cmd_vel[1]:+.2f},{cmd_vel[2]:+.2f}) "
                   f"| z={data.qpos[2]:.3f}")
 
-    renderer.close()
+    con.free()
     glfw.terminate()
 
 
