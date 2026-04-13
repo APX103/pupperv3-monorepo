@@ -1,6 +1,6 @@
 # Pupper V3 Standalone MuJoCo Simulation
 
-独立于 ROS2 的 MuJoCo 仿真环境，直接加载训练好的 RL 策略控制四足机器人行走。
+独立于 ROS2 的 MuJoCo 仿真环境，支持加载 RL 策略或播放预录制的动作动画。
 
 ## 前置条件
 
@@ -20,16 +20,20 @@ uv sync
 # 拉取策略文件（Git LFS）
 git lfs pull --include="ros2_ws/src/neural_controller/launch/policy_latest.json"
 
-# 启动仿真
+# 加载 RL 策略
 cd sim
 uv run python pupperv3_sim.py ../ros2_ws/src/neural_controller/launch/policy_latest.json
 ```
 
-不带策略启动（零动作，仅渲染）：
+播放预录制动画：
 
 ```bash
-uv run python pupperv3_sim.py
+uv run python pupperv3_sim.py --animation <动画名>
 ```
+
+可用的动画：`stand_sit_stand`、`stand_sit_shake_sit_stand`、`lie_sit_lie`、`push_up`、`spider`、`swim`、`twerk`、`sneeze`、`stand_downward_dog`、`lie_downward_dog`、`upward_dog`、`superman`、`pee2`。
+
+动画播放完后保持最后一帧，按 `R` 重置后重新播放。
 
 ## 键盘控制
 

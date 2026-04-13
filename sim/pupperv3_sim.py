@@ -1,5 +1,6 @@
 """Standalone MuJoCo simulation for Pupper V3 with keyboard control."""
 
+import argparse
 import sys
 from pathlib import Path
 
@@ -10,6 +11,7 @@ import numpy as np
 from config import (
     ACTION_SCALE_DEFAULT,
     DEFAULT_JOINT_POS,
+    JOINT_NAMES,
     MODEL_XML,
     NUM_JOINTS,
     OBSERVATION_LIMIT,
@@ -24,12 +26,77 @@ from observations import ObservationBuilder
 from policy import RTNeuralPolicy
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+ANIMATIONS_DIR = REPO_ROOT / "ros2_ws/src/animation_controller_py/launch/animations"
 
 WINDOW_W, WINDOW_H = 1280, 720
 
 
+def find_animation_csv(name: str) -> Path:
+    matches = list(ANIMATIONS_DIR.glob(f"{name}*.csv"))
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        print(f"Multiple matches for '{name}':")
+        for m in matches:
+            print(f"  {m.name}")
+        sys.exit(1)
+    print(f"No animation found matching '{name}'")
+    print("Available animations:")
+    for f in sorted(ANIMATIONS_DIR.glob("*.csv")):
+        print(f"  {f.stem.split('_recording')[0]}")
+    sys.exit(1)
+
+
+def load_animation(csv_path: Path):
+    import csv as csv_mod
+
+    with open(csv_path) as f:
+        reader = csv_mod.reader(f)
+        header = next(reader)
+        csv_col_to_sim_idx = {}
+        for col_idx, col_name in enumerate(header[2:]):
+            if col_name in JOINT_NAMES:
+                csv_col_to_sim_idx[col_idx] = JOINT_NAMES.index(col_name)
+        timestamps = []
+        joint_data = []
+        for row in reader:
+            timestamps.append(float(row[1]))
+            joints = np.zeros(NUM_JOINTS, dtype=np.float64)
+            for col_idx, sim_idx in csv_col_to_sim_idx.items():
+                joints[sim_idx] = float(row[col_idx + 2])
+            joint_data.append(joints)
+
+    keyframes = np.array(joint_data)
+    if len(timestamps) > 1:
+        frame_rate = 1.0 / np.median(np.diff(timestamps))
+    else:
+        frame_rate = 30.0
+    return keyframes, frame_rate
+
+
+def interpolate_keyframes(keyframes, frame_rate, elapsed):
+    total = len(keyframes)
+    duration = (total - 1) / frame_rate
+    if elapsed >= duration:
+        return keyframes[-1]
+    exact = elapsed * frame_rate
+    idx = int(exact)
+    alpha = exact - idx
+    if idx + 1 < total:
+        return keyframes[idx] * (1 - alpha) + keyframes[idx + 1] * alpha
+    return keyframes[idx]
+
+
 def main():
-    policy_path = sys.argv[1] if len(sys.argv) > 1 else None
+    parser = argparse.ArgumentParser(description="Pupper V3 MuJoCo Simulation")
+    parser.add_argument("policy", nargs="?", help="Path to policy JSON")
+    parser.add_argument("--animation", help="Animation name (e.g. stand_sit_stand, push_up)")
+    args = parser.parse_args()
+
+    if args.animation and args.policy:
+        print("Cannot use both --animation and policy. Choose one.")
+        sys.exit(1)
+
     xml_path = REPO_ROOT / MODEL_XML
 
     # Load MuJoCo model
@@ -37,15 +104,25 @@ def main():
     model.opt.timestep = PHYSICS_DT
     data = mujoco.MjData(model)
 
-    # Load policy
-    if policy_path:
-        policy = RTNeuralPolicy(policy_path)
+    # Load animation or policy
+    keyframes = None
+    frame_rate = 0.0
+    if args.animation:
+        csv_path = find_animation_csv(args.animation)
+        keyframes, frame_rate = load_animation(csv_path)
+        print(f"Loaded animation: {csv_path.name} ({len(keyframes)} frames, {frame_rate:.1f}Hz)")
+        policy = None
+        default_pos = np.array(DEFAULT_JOINT_POS, dtype=np.float32)
+    elif args.policy:
+        policy = RTNeuralPolicy(args.policy)
         print(f"Loaded policy: input={policy.input_size}, output={policy.output_size}, "
               f"history={policy.observation_history}, action_scale={policy.action_scale}")
     else:
-        print("No policy provided. Running with zero actions.")
+        print("No policy or animation provided.")
         print("Usage: python pupperv3_sim.py <policy.json>")
-        policy = None
+        print("       python pupperv3_sim.py --animation <name>")
+        parser.print_help()
+        sys.exit(1)
 
     # Resolve parameters from policy JSON or defaults
     default_pos = policy.default_joint_pos if policy else np.array(DEFAULT_JOINT_POS, dtype=np.float32)
@@ -70,6 +147,8 @@ def main():
     # State
     cmd_vel = np.array([0.0, 0.0, 0.0], dtype=np.float32)
     last_action = np.zeros(NUM_JOINTS, dtype=np.float32)
+    anim_start_time = None
+    anim_done_printed = False
 
     # Init robot pose
     mujoco.mj_resetData(model, data)
@@ -131,6 +210,9 @@ def main():
                 data.qpos[adr] = default_pos[i]
             mujoco.mj_forward(model, data)
             last_action = np.zeros(NUM_JOINTS, dtype=np.float32)
+            nonlocal anim_start_time, anim_done_printed
+            anim_start_time = None
+            anim_done_printed = False
             print("Reset.")
 
     glfw.set_key_callback(window, on_key)
@@ -198,19 +280,30 @@ def main():
         quat = np.array(data.sensor("body_quat").data[:4], dtype=np.float32)
         joint_pos = np.array([data.qpos[adr] for adr in joint_qpos_adr], dtype=np.float32)
 
-        # Build observation and run policy
-        obs = obs_builder.build(ang_vel, quat, cmd_vel, joint_pos, last_action)
-
-        if policy is not None:
-            raw_action = policy.forward(obs)
+        # Compute target positions
+        if keyframes is not None:
+            if anim_start_time is None:
+                anim_start_time = data.time
+                # Initialize joints to first keyframe
+                first_kf = keyframes[0].astype(np.float32)
+                for i, adr in enumerate(joint_qpos_adr):
+                    data.qpos[adr] = first_kf[i]
+                mujoco.mj_forward(model, data)
+            elapsed = data.time - anim_start_time
+            target_pos = interpolate_keyframes(keyframes, frame_rate, elapsed).astype(np.float32)
+            if elapsed >= (len(keyframes) - 1) / frame_rate and not anim_done_printed:
+                print("Animation complete. Holding last frame.")
+                anim_done_printed = True
+            data.ctrl[:] = np.clip(target_pos, joint_lower, joint_upper)
         else:
-            raw_action = np.zeros(NUM_JOINTS, dtype=np.float32)
-
-        last_action = raw_action.copy()
-
-        # Target position = scaled action + default
-        target_pos = np.clip(raw_action * action_scale + default_pos, joint_lower, joint_upper)
-        data.ctrl[:] = target_pos
+            obs = obs_builder.build(ang_vel, quat, cmd_vel, joint_pos, last_action)
+            if policy is not None:
+                raw_action = policy.forward(obs)
+            else:
+                raw_action = np.zeros(NUM_JOINTS, dtype=np.float32)
+            last_action = raw_action.copy()
+            target_pos = np.clip(raw_action * action_scale + default_pos, joint_lower, joint_upper)
+            data.ctrl[:] = target_pos
 
         # Step physics
         for _ in range(PHYSICS_STEPS_PER_POLICY):
