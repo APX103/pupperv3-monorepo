@@ -17,7 +17,6 @@ setup(
     maintainer_email='nathankau@gmail.com',
     description='WebSocket server for LLM robot control integration',
     license='LGPL-3.0-only',
-    tests_require=['pytest'],
     entry_points={
         'console_scripts': [
             'websocket_server = llm_websocket_server.websocket_server:main',

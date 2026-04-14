@@ -23,7 +23,6 @@ setup(
     maintainer_email='nathankau@gmail.com',
     description='Python animation controller that publishes to forward command controllers',
     license='Apache-2.0',
-    tests_require=['pytest'],
     entry_points={
         'console_scripts': [
             'animation_controller_py = animation_controller_py.animation_controller:main',

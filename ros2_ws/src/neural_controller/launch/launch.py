@@ -46,6 +46,15 @@ def generate_launch_description():
         ),
     )
 
+    declare_hailo_arg = DeclareLaunchArgument(
+        name="hailo",
+        default_value="False",
+        description=(
+            "Run `ros2 launch neural_controller launch.py hailo:=True` to enable Hailo object detection "
+            "and person following, otherwise the default value of False will skip them."
+        ),
+    )
+
     #
     # 2. Construct the path to the URDF file using IfElseSubstitution
 
@@ -276,6 +285,7 @@ def generate_launch_description():
         executable="hailo_detection",
         output="both",
         parameters=[node_parameters],
+        condition=IfCondition(LaunchConfiguration("hailo")),
     )
 
     person_following_node = Node(
@@ -283,6 +293,7 @@ def generate_launch_description():
         executable="person_follower_node",
         output="both",
         parameters=[node_parameters],
+        condition=IfCondition(LaunchConfiguration("hailo")),
     )
 
     #
@@ -320,4 +331,4 @@ def generate_launch_description():
     #
     # 8. Return the LaunchDescription with the declared arg + all nodes
     #
-    return LaunchDescription([declare_sim_arg, declare_teleop_arg, declare_bag_recorder_arg, *nodes])
+    return LaunchDescription([declare_sim_arg, declare_teleop_arg, declare_bag_recorder_arg, declare_hailo_arg, *nodes])

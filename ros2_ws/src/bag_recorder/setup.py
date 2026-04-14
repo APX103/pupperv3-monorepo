@@ -20,7 +20,6 @@ setup(
     maintainer_email='your@email.com',
     description='ROS2 bag recorder controlled by joystick buttons',
     license='MIT',
-    tests_require=['pytest'],
     entry_points={
         'console_scripts': [
             'bag_recorder_node = bag_recorder.bag_recorder_node:main',
