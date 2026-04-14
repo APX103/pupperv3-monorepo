@@ -161,6 +161,8 @@ def main():
     last_action = np.zeros(NUM_JOINTS, dtype=np.float32)
     anim_start_time = None
     anim_done_printed = False
+    anim_blend_start = None  # joint positions when animation started (for blending)
+    ANIM_BLEND_DURATION = 1.0  # seconds to blend from current pose into new animation
 
     # Move command timer (for timed moves from ZMQ)
     move_end_time = 0.0
@@ -235,9 +237,10 @@ def main():
                 data.qpos[adr] = default_pos[i]
             mujoco.mj_forward(model, data)
             last_action = np.zeros(NUM_JOINTS, dtype=np.float32)
-            nonlocal anim_start_time, anim_done_printed
+            nonlocal anim_start_time, anim_done_printed, anim_blend_start
             anim_start_time = None
             anim_done_printed = False
+            anim_blend_start = None
             print("Reset.")
 
     glfw.set_key_callback(window, on_key)
@@ -325,6 +328,8 @@ def main():
                         keyframes, frame_rate = load_animation(csv_path)
                         anim_start_time = None
                         anim_done_printed = False
+                        # Snapshot current joint positions for blending
+                        anim_blend_start = np.array([data.qpos[adr] for adr in joint_qpos_adr], dtype=np.float32)
                         print(f"[ZMQ] animation: {csv_name} ({len(keyframes)} frames, {frame_rate:.1f}Hz)")
                     else:
                         print(f"[ZMQ] animation not found: {csv_path}")
@@ -334,6 +339,7 @@ def main():
                     keyframes = None
                     anim_start_time = None
                     anim_done_printed = False
+                    anim_blend_start = None
                     move_end_time = 0.0
                     print("[ZMQ] stop")
 
@@ -347,6 +353,7 @@ def main():
                     keyframes = None
                     anim_start_time = None
                     anim_done_printed = False
+                    anim_blend_start = None
                     move_end_time = 0.0
                     print("[ZMQ] reset")
 
@@ -364,13 +371,16 @@ def main():
         if keyframes is not None:
             if anim_start_time is None:
                 anim_start_time = data.time
-                # Initialize joints to first keyframe
-                first_kf = keyframes[0].astype(np.float32)
-                for i, adr in enumerate(joint_qpos_adr):
-                    data.qpos[adr] = first_kf[i]
-                mujoco.mj_forward(model, data)
             elapsed = data.time - anim_start_time
             target_pos = interpolate_keyframes(keyframes, frame_rate, elapsed).astype(np.float32)
+            # Blend from current pose into animation over ANIM_BLEND_DURATION
+            if anim_blend_start is not None and elapsed < ANIM_BLEND_DURATION:
+                alpha = elapsed / ANIM_BLEND_DURATION
+                # Smooth step (ease in-out)
+                alpha = alpha * alpha * (3.0 - 2.0 * alpha)
+                target_pos = (1.0 - alpha) * anim_blend_start + alpha * target_pos
+            else:
+                anim_blend_start = None
             if elapsed >= (len(keyframes) - 1) / frame_rate and not anim_done_printed:
                 print("Animation complete. Holding last frame.")
                 anim_done_printed = True

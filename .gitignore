@@ -13,3 +13,4 @@ untracked_bags
 
 # Local STT/TTS models (large files, download via script)
 sim/models/
+sim/.env
