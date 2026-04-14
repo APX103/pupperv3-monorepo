@@ -6,6 +6,21 @@ dependencies = [
     "glfw>=2.10.0",
     "mujoco>=2.3.0",
     "numpy>=1.24",
+    "pyzmq>=25.0",
+]
+
+[project.optional-dependencies]
+agent = [
+    "livekit>=0.17",
+    "livekit-agents>=0.10",
+    "python-dotenv>=1.0",
+    # Cloud STT/TTS/LLM (replace with local models later)
+    "livekit-plugins-openai>=0.10",
+    "livekit-plugins-cartesia>=0.10",
+    "livekit-plugins-deepgram>=0.10",
+    # Local STT/TTS
+    "sherpa-onnx>=1.10",
+    "piper-tts>=1.2",
 ]
 
 [tool.hatch.build.targets.wheel]

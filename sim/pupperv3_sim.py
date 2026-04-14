@@ -1,7 +1,8 @@
-"""Standalone MuJoCo simulation for Pupper V3 with keyboard control."""
+"""Standalone MuJoCo simulation for Pupper V3 with keyboard and ZMQ control."""
 
 import argparse
 import sys
+import time
 from pathlib import Path
 
 import glfw
@@ -27,6 +28,9 @@ from policy import RTNeuralPolicy
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 ANIMATIONS_DIR = REPO_ROOT / "ros2_ws/src/animation_controller_py/launch/animations"
+
+# ZMQ command socket address
+ZMQ_CMD_ADDR = "ipc:///tmp/pupper_sim_cmd"
 
 WINDOW_W, WINDOW_H = 1280, 720
 
@@ -91,11 +95,14 @@ def main():
     parser = argparse.ArgumentParser(description="Pupper V3 MuJoCo Simulation")
     parser.add_argument("policy", nargs="?", help="Path to policy JSON")
     parser.add_argument("--animation", help="Animation name (e.g. stand_sit_stand, push_up)")
+    parser.add_argument("--zmq", action="store_true", help="Enable ZMQ command socket for external control")
     args = parser.parse_args()
 
     if args.animation and args.policy:
         print("Cannot use both --animation and policy. Choose one.")
         sys.exit(1)
+
+    require_action = not args.zmq  # --zmq mode can start idle, wait for commands
 
     xml_path = REPO_ROOT / MODEL_XML
 
@@ -117,12 +124,17 @@ def main():
         policy = RTNeuralPolicy(args.policy)
         print(f"Loaded policy: input={policy.input_size}, output={policy.output_size}, "
               f"history={policy.observation_history}, action_scale={policy.action_scale}")
-    else:
+    elif require_action:
         print("No policy or animation provided.")
         print("Usage: python pupperv3_sim.py <policy.json>")
         print("       python pupperv3_sim.py --animation <name>")
+        print("       python pupperv3_sim.py --zmq [<policy.json>]")
         parser.print_help()
         sys.exit(1)
+    else:
+        # --zmq mode without policy: start idle, wait for commands
+        policy = None
+        print("ZMQ mode: waiting for external commands (animation/move/stop)")
 
     # Resolve parameters from policy JSON or defaults
     default_pos = policy.default_joint_pos if policy else np.array(DEFAULT_JOINT_POS, dtype=np.float32)
@@ -149,6 +161,19 @@ def main():
     last_action = np.zeros(NUM_JOINTS, dtype=np.float32)
     anim_start_time = None
     anim_done_printed = False
+
+    # Move command timer (for timed moves from ZMQ)
+    move_end_time = 0.0
+
+    # --- ZMQ command socket (optional) ---
+    zmq_socket = None
+    if args.zmq:
+        import zmq
+        zmq_ctx = zmq.Context()
+        zmq_socket = zmq_ctx.socket(zmq.SUB)
+        zmq_socket.connect(ZMQ_CMD_ADDR)
+        zmq_socket.setsockopt_string(zmq.SUBSCRIBE, "")
+        print(f"ZMQ command socket listening on {ZMQ_CMD_ADDR}")
 
     # Init robot pose
     mujoco.mj_resetData(model, data)
@@ -274,6 +299,61 @@ def main():
     step_count = 0
     while not glfw.window_should_close(window):
         glfw.poll_events()
+
+        # --- Poll ZMQ commands ---
+        if zmq_socket is not None:
+            while zmq_socket.poll(0, zmq.POLLIN):
+                msg = zmq_socket.recv_json()
+                cmd_type = msg.get("type", "")
+
+                if cmd_type == "move":
+                    vx = float(msg.get("vx", 0.0))
+                    vy = float(msg.get("vy", 0.0))
+                    wz = float(msg.get("wz", 0.0))
+                    duration = float(msg.get("duration", 0.0))
+                    cmd_vel[0] = np.clip(vx, VEL_X_RANGE[0], VEL_X_RANGE[1])
+                    cmd_vel[1] = np.clip(vy, VEL_Y_RANGE[0], VEL_Y_RANGE[1])
+                    cmd_vel[2] = np.clip(wz, VEL_YAW_RANGE[0], VEL_YAW_RANGE[1])
+                    if duration > 0:
+                        move_end_time = time.monotonic() + duration
+                    print(f"[ZMQ] move: vx={vx}, vy={vy}, wz={wz}, dur={duration}")
+
+                elif cmd_type == "animation":
+                    csv_name = msg.get("name", "")
+                    csv_path = ANIMATIONS_DIR / f"{csv_name}.csv"
+                    if csv_path.exists():
+                        keyframes, frame_rate = load_animation(csv_path)
+                        anim_start_time = None
+                        anim_done_printed = False
+                        print(f"[ZMQ] animation: {csv_name} ({len(keyframes)} frames, {frame_rate:.1f}Hz)")
+                    else:
+                        print(f"[ZMQ] animation not found: {csv_path}")
+
+                elif cmd_type == "stop":
+                    cmd_vel[:] = 0.0
+                    keyframes = None
+                    anim_start_time = None
+                    anim_done_printed = False
+                    move_end_time = 0.0
+                    print("[ZMQ] stop")
+
+                elif cmd_type == "reset":
+                    mujoco.mj_resetData(model, data)
+                    for i, adr in enumerate(joint_qpos_adr):
+                        data.qpos[adr] = default_pos[i]
+                    mujoco.mj_forward(model, data)
+                    last_action = np.zeros(NUM_JOINTS, dtype=np.float32)
+                    cmd_vel[:] = 0.0
+                    keyframes = None
+                    anim_start_time = None
+                    anim_done_printed = False
+                    move_end_time = 0.0
+                    print("[ZMQ] reset")
+
+        # Auto-zero move command when timer expires
+        if move_end_time > 0 and time.monotonic() >= move_end_time:
+            cmd_vel[:] = 0.0
+            move_end_time = 0.0
 
         # Read sensors
         ang_vel = np.array(data.sensor("body_gyro").data[:3], dtype=np.float32)

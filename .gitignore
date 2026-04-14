@@ -10,3 +10,6 @@ ros2_ws/install/
 untracked_bags
 
 *.wav
+
+# Local STT/TTS models (large files, download via script)
+sim/models/
